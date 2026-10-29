@@ -1,0 +1,154 @@
+diff --git a/node_modules/whatsapp-web.js/src/structures/Message.js b/node_modules/whatsapp-web.js/src/structures/Message.js
+index 91a9c24..ea617c3 100644
+--- a/node_modules/whatsapp-web.js/src/structures/Message.js
++++ b/node_modules/whatsapp-web.js/src/structures/Message.js
+@@ -515,14 +515,124 @@
+             return undefined;
+         }
+ 
+-        const result = await this.client.pupPage.evaluate(async (msgId) => {
+-            const msg =
+-                window.require('WAWebCollections').Msg.get(msgId) ||
+-                (
+-                    await window
+-                        .require('WAWebCollections')
+-                        .Msg.getMessagesById([msgId])
+-                )?.messages?.[0];
++        const result = await this.client.pupPage.evaluate(async (messageId) => {
++            const Msg = window.require('WAWebCollections').Msg;
++            const candidates = [];
++            const stringCandidates = new Set();
++            const addCandidate = (candidate) => {
++                if (!candidate) return;
++                if (typeof candidate === 'string') {
++                    if (stringCandidates.has(candidate)) return;
++                    stringCandidates.add(candidate);
++                }
++                candidates.push(candidate);
++            };
++
++            const id =
++                typeof messageId === 'string'
++                    ? { _serialized: messageId }
++                    : messageId;
++            const serializedId = id?._serialized || id?.$1;
++            const widFactory = window.require('WAWebWidFactory');
++            const key = id
++                ? {
++                      ...id,
++                      remote:
++                          typeof id.remote === 'string'
++                              ? widFactory.createWid(id.remote)
++                              : id.remote,
++                      participant:
++                          typeof id.participant === 'string'
++                              ? widFactory.createWid(id.participant)
++                              : id.participant,
++                  }
++                : null;
++
++            addCandidate(serializedId);
++            addCandidate(id?.id);
++            addCandidate(id);
++            addCandidate(key);
++            if (key) {
++                addCandidate({
++                    fromMe: key.fromMe,
++                    remote: key.remote,
++                    id: key.id,
++                    participant: key.participant,
++                    _serialized: serializedId,
++                });
++            }
++
++            let msg;
++            for (const candidate of candidates) {
++                try {
++                    msg = Msg.get(candidate);
++                } catch (error) {
++                    // Try other known message-key formats.
++                }
++                if (msg) break;
++            }
++
++            if (!msg && serializedId) {
++                try {
++                    msg = (
++                        await Msg.getMessagesById([serializedId])
++                    )?.messages?.[0];
++                } catch (error) {
++                    // Fall back to the in-memory message collection.
++                }
++            }
++
++            if (!msg) {
++                const models =
++                    Msg.getModelsArray?.() ||
++                    Msg.models ||
++                    Msg._models ||
++                    [];
++                const messages = Array.isArray(models)
++                    ? models
++                    : Object.values(models);
++                msg = messages.find((candidate) => {
++                    const candidateId = candidate.id;
++                    if (!candidateId || !id) return false;
++                    if (
++                        serializedId &&
++                        (candidateId._serialized === serializedId ||
++                            candidateId.$1 === serializedId)
++                    ) {
++                        return true;
++                    }
++
++                    const candidateRemote =
++                        typeof candidateId.remote === 'string'
++                            ? candidateId.remote
++                            : candidateId.remote?._serialized;
++                    const targetRemote =
++                        typeof id.remote === 'string'
++                            ? id.remote
++                            : id.remote?._serialized;
++                    const candidateParticipant =
++                        typeof candidateId.participant === 'string'
++                            ? candidateId.participant
++                            : candidateId.participant?._serialized;
++                    const targetParticipant =
++                        typeof id.participant === 'string'
++                            ? id.participant
++                            : id.participant?._serialized;
++
++                    return (
++                        candidateId.id === id.id &&
++                        candidateId.fromMe === id.fromMe &&
++                        candidateRemote === targetRemote &&
++                        candidateParticipant === targetParticipant
++                    );
++                });
++            }
++
++            if (!msg) {
++                throw new Error(
++                    `WhatsApp message lookup failed; id fields: ${Object.keys(id || {}).join(', ') || 'none'}`,
++                );
++            }
+ 
+             // REUPLOADING mediaStage means the media is expired and the download button is spinning, cannot be downloaded now
+             if (
+@@ -566,6 +676,7 @@
+                         mediaKey: msg.mediaKey,
+                         mediaKeyTimestamp: msg.mediaKeyTimestamp,
+                         type: msg.type,
++                        mimetype: msg.mimetype,
+                         signal: new AbortController().signal,
+                         downloadQpl: mockQpl,
+                     });
+@@ -585,7 +696,7 @@
+                 if (e.status && e.status === 404) return undefined;
+                 throw e;
+             }
+-        }, this.id._serialized);
++        }, this.id);
+ 
+         if (!result) return undefined;
+         return new MessageMedia(
