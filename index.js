@@ -28,6 +28,25 @@ function updatePendingBotReply(chatId, text, amount) {
   pendingBotReplies.set(key, { count, timer });
 }
 
+function getSerializedId(value) {
+  if (typeof value === 'string') return value;
+  return value?._serialized || value?.$1 || null;
+}
+
+function getMessageChatId(msg) {
+  const remoteChatId = getSerializedId(msg.id?.remote);
+  if (remoteChatId?.endsWith('@g.us')) {
+    return remoteChatId;
+  }
+
+  const directionalChatId = msg.fromMe ? msg.to : msg.from;
+  if (directionalChatId?.endsWith('@g.us')) {
+    return directionalChatId;
+  }
+
+  return remoteChatId || directionalChatId || null;
+}
+
 async function getCachedGroupName(chatId) {
   return client.pupPage.evaluate((id) => {
     const wid = window.require('WAWebWidFactory').createWid(id);
@@ -125,9 +144,15 @@ client.on('auth_failure', (message) => {
 
 async function processMessage(msg) {
   try {
-    const chatId = msg.fromMe ? msg.to : msg.from;
+    const chatId = getMessageChatId(msg);
     const isGroup = typeof chatId === 'string' && chatId.endsWith('@g.us');
-    console.log(`Mensagem ${msg.fromMe ? 'enviada' : 'recebida'}; identificador de grupo:`, isGroup);
+    if (!isGroup) {
+      console.log(`Mensagem ${msg.fromMe ? 'enviada' : 'recebida'} ignorada; sufixos dos identificadores:`, {
+        from: getSerializedId(msg.from)?.split('@').pop() || 'ausente',
+        to: getSerializedId(msg.to)?.split('@').pop() || 'ausente',
+        remote: getSerializedId(msg.id?.remote)?.split('@').pop() || 'ausente',
+      });
+    }
     if (!isGroup) {
       return;
     }
@@ -204,8 +229,7 @@ async function processMessage(msg) {
     console.log('Webhook respondeu com status:', response.status);
     const reply = response.data?.mensagem || response.data?.message;
     if (typeof reply === 'string' && reply) {
-      const replyChatId = msg.fromMe ? msg.to : msg.from;
-      updatePendingBotReply(replyChatId, reply, 1);
+      updatePendingBotReply(chatId, reply, 1);
 
       try {
         await msg.reply(reply);
