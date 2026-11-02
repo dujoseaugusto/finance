@@ -1,5 +1,6 @@
 require('dotenv').config();
 
+const { randomUUID } = require('crypto');
 const axios = require('axios');
 const qrcode = require('qrcode-terminal');
 const { Client, LocalAuth } = require('whatsapp-web.js');
@@ -8,6 +9,30 @@ const groupName = process.env.NOME_DO_GRUPO;
 const webhookUrl = process.env.WEBHOOK_URL;
 const pendingBotReplies = new Map();
 const outgoingImagesBeingChecked = new Set();
+
+function log(level, event, details = {}) {
+  const write = level === 'error'
+    ? console.error
+    : level === 'warn'
+      ? console.warn
+      : console.log;
+
+  write(JSON.stringify({
+    timestamp: new Date().toISOString(),
+    level,
+    event,
+    ...details,
+  }));
+}
+
+function getErrorDetails(error) {
+  const message = error?.message || String(error);
+  return {
+    errorName: error?.name || 'Error',
+    errorMessage: webhookUrl ? message.split(webhookUrl).join('[URL REDIGIDA]') : message,
+    ...(error?.response?.status ? { httpStatus: error.response.status } : {}),
+  };
+}
 
 function updatePendingBotReply(chatId, text, amount) {
   const key = `${chatId}:${text}`;
@@ -55,16 +80,15 @@ async function getCachedGroupName(chatId) {
   }, chatId);
 }
 
-async function waitForOutgoingImage(msg) {
-  const messageId = msg.id._serialized;
+async function waitForOutgoingImage(msg, correlationId) {
   const timeoutMs = 30000;
   const intervalMs = 1000;
   const startedAt = Date.now();
 
   while (Date.now() - startedAt < timeoutMs) {
     if (msg.ack >= 1 && msg.hasMedia) {
-      console.log('WhatsApp confirmou o envio da imagem; processando a mensagem.');
-      await processMessage(msg);
+      log('info', 'image_upload_confirmed', { correlationId, ack: msg.ack });
+      await processMessage(msg, correlationId);
       return;
     }
 
@@ -82,33 +106,42 @@ async function waitForOutgoingImage(msg) {
     ]).finally(() => clearTimeout(timeoutHandle));
 
     if (reloadTimedOut) {
-      console.error(`O WhatsApp Web não respondeu ao recarregar a imagem ${messageId} em 5 segundos.`);
+      log('error', 'image_upload_reload_timeout', { correlationId, timeoutMs: reloadTimeoutMs });
       return;
     }
 
     if (!reloadedMessage) {
-      console.error(`Não foi possível recarregar a mensagem de imagem ${messageId}.`);
+      log('error', 'image_upload_reload_failed', { correlationId });
       return;
     }
 
     if (msg.ack >= 1 && msg.hasMedia) {
-      console.log('WhatsApp confirmou o envio da imagem; processando a mensagem.');
-      await processMessage(msg);
+      log('info', 'image_upload_confirmed', { correlationId, ack: msg.ack });
+      await processMessage(msg, correlationId);
       return;
     }
 
     await new Promise((resolve) => setTimeout(resolve, intervalMs));
   }
 
-  console.error(
-    `A imagem ${messageId} não foi confirmada pelo WhatsApp após 30 segundos (ACK atual: ${msg.ack}).`,
-  );
+  log('error', 'image_upload_confirmation_timeout', {
+    correlationId,
+    timeoutMs,
+    ack: msg.ack,
+  });
 }
 
 if (!groupName || !webhookUrl) {
-  console.error('Configure NOME_DO_GRUPO e WEBHOOK_URL no arquivo .env.');
+  log('error', 'configuration_invalid', {
+    missing: [
+      ...(!groupName ? ['NOME_DO_GRUPO'] : []),
+      ...(!webhookUrl ? ['WEBHOOK_URL'] : []),
+    ],
+  });
   process.exit(1);
 }
+
+log('info', 'configuration_valid');
 
 const client = new Client({
     authStrategy: new LocalAuth(),
@@ -120,57 +153,84 @@ const client = new Client({
 });
 
 client.on('qr', (qr) => {
+  log('info', 'authentication_qr_generated');
   console.log('Escaneie o QR code abaixo com o WhatsApp:');
   qrcode.generate(qr, { small: true });
 });
 
+client.on('authenticated', () => {
+  log('info', 'whatsapp_authenticated');
+});
+
 client.on('ready', async () => {
-  console.log('Bot conectado ao WhatsApp.');
+  log('info', 'whatsapp_ready');
   try {
     const runtime = await client.pupPage.evaluate(() => ({
-      userAgent: navigator.userAgent,
       webVersion: window.Debug?.VERSION || 'desconhecida',
     }));
-    console.log('WhatsApp Web em uso:', runtime.webVersion);
-    console.log('Navegador em uso:', runtime.userAgent);
+    log('info', 'runtime_versions', runtime);
   } catch (error) {
-    console.error('Não foi possível verificar as versões em execução:', error.message);
+    log('warn', 'runtime_versions_unavailable', getErrorDetails(error));
   }
 });
 
-client.on('auth_failure', (message) => {
-  console.error('Falha na autenticação do WhatsApp:', message);
+client.on('auth_failure', () => {
+  log('error', 'whatsapp_auth_failure');
 });
 
-async function processMessage(msg) {
+client.on('disconnected', (reason) => {
+  log('error', 'whatsapp_disconnected', { reason: String(reason) });
+});
+
+client.on('change_state', (state) => {
+  log('info', 'whatsapp_state_changed', { state });
+});
+
+async function processMessage(msg, correlationId = randomUUID()) {
+  let stage = 'message_received';
   try {
+    log('info', 'message_received', {
+      correlationId,
+      direction: msg.fromMe ? 'outgoing' : 'incoming',
+      type: msg.type,
+      hasMedia: Boolean(msg.hasMedia),
+    });
+
+    stage = 'identify_chat';
     const chatId = getMessageChatId(msg);
     const isGroup = typeof chatId === 'string' && chatId.endsWith('@g.us');
     if (!isGroup) {
-      console.log(`Mensagem ${msg.fromMe ? 'enviada' : 'recebida'} ignorada; sufixos dos identificadores:`, {
-        from: getSerializedId(msg.from)?.split('@').pop() || 'ausente',
-        to: getSerializedId(msg.to)?.split('@').pop() || 'ausente',
-        remote: getSerializedId(msg.id?.remote)?.split('@').pop() || 'ausente',
-      });
-    }
-    if (!isGroup) {
+      log('info', 'message_ignored_not_group', { correlationId });
       return;
     }
 
     if (msg.fromMe && pendingBotReplies.has(`${chatId}:${msg.body}`)) {
       updatePendingBotReply(chatId, msg.body, -1);
-      console.log('Resposta automática identificada; não será reenviada ao webhook.');
+      log('info', 'bot_reply_echo_ignored', { correlationId });
       return;
     }
 
+    stage = 'resolve_group';
+    log('info', 'group_lookup_started', { correlationId });
     const currentGroupName = await getCachedGroupName(chatId);
+    log('info', 'group_lookup_completed', {
+      correlationId,
+      matched: currentGroupName === groupName,
+    });
+    if (currentGroupName && currentGroupName !== groupName) {
+      log('warn', 'group_name_mismatch', {
+        correlationId,
+        configuredGroupName: groupName,
+        whatsappGroupName: currentGroupName,
+      });
+    }
     if (!currentGroupName) {
-      console.warn('Mensagem de grupo ignorada: conversa não encontrada no cache do WhatsApp.');
+      log('warn', 'message_ignored_group_not_in_cache', { correlationId });
       return;
     }
 
     if (currentGroupName !== groupName) {
-      console.log(`Mensagem de outro grupo ignorada: "${currentGroupName}".`);
+      log('info', 'message_ignored_other_group', { correlationId });
       return;
     }
 
@@ -180,95 +240,138 @@ async function processMessage(msg) {
     const temNumeroNoTexto = /\d/.test(textoMensagem);
 
     if (!temTextoValido && !temImagem) {
-      console.log('Mensagem ignorada: não contém texto nem imagem válida.');
+      log('info', 'message_ignored_empty', { correlationId });
       return;
     }
 
     if (!temNumeroNoTexto && !temImagem) {
-      console.log('Mensagem ignorada: sem número e sem imagem.');
+      log('info', 'message_ignored_without_number_or_image', { correlationId });
       return;
     }
 
-    console.log(`Mensagem do grupo configurado recebida: "${currentGroupName}". Enviando ao webhook.`);
+    log('info', 'message_accepted', { correlationId, hasImage: temImagem });
+    stage = 'resolve_sender';
     const contact = msg.fromMe ? null : await msg.getContact();
     const usuario = msg.fromMe
       ? client.info?.pushname || 'Eu'
       : contact?.pushname || contact?.name || 'Não identificado';
+    log('info', 'sender_resolved', {
+      correlationId,
+      senderType: msg.fromMe ? 'self' : 'contact',
+    });
     let imagemBase64 = null;
 
     if (temImagem) {
-      console.log('Diagnóstico da chave da mensagem:', {
-        idFields: Object.keys(msg.id || {}),
-        serializedPresent: typeof msg.id?._serialized === 'string',
-        serializedAlternatePresent: typeof msg.id?.$1 === 'string',
-        remoteType: typeof msg.id?.remote,
-        participantType: typeof msg.id?.participant,
-      });
-
       let media;
+      const imageDownloadStartedAt = Date.now();
       try {
+        stage = 'download_image';
+        log('info', 'image_download_started', { correlationId });
         media = await msg.downloadMedia();
       } catch (error) {
-        console.error('O WhatsApp Web falhou ao baixar a imagem; o webhook não será chamado.');
+        log('error', 'image_download_failed', {
+          correlationId,
+          durationMs: Date.now() - imageDownloadStartedAt,
+          ...getErrorDetails(error),
+        });
         throw error;
       }
 
       if (!media || !media.mimetype?.startsWith('image/')) {
-        console.error('A mensagem contém uma imagem, mas o WhatsApp Web não retornou a mídia para download.');
+        log('error', 'image_download_invalid_result', { correlationId });
         return;
       }
       imagemBase64 = media.data;
+      log('info', 'image_download_completed', {
+        correlationId,
+        mimeType: media.mimetype,
+        durationMs: Date.now() - imageDownloadStartedAt,
+      });
     }
 
-    const response = await axios.post(webhookUrl, {
-      usuario,
-      texto: msg.body,
-      imagemBase64,
-    });
+    stage = 'webhook_request';
+    const webhookStartedAt = Date.now();
+    log('info', 'webhook_request_started', { correlationId });
+    let response;
+    try {
+      response = await axios.post(webhookUrl, {
+        usuario,
+        texto: msg.body,
+        imagemBase64,
+      });
+    } catch (error) {
+      log('error', 'webhook_request_failed', {
+        correlationId,
+        durationMs: Date.now() - webhookStartedAt,
+        ...getErrorDetails(error),
+      });
+      throw error;
+    }
 
-    console.log('Webhook respondeu com status:', response.status);
+    log('info', 'webhook_request_completed', {
+      correlationId,
+      httpStatus: response.status,
+      durationMs: Date.now() - webhookStartedAt,
+    });
     const reply = response.data?.mensagem || response.data?.message;
     if (typeof reply === 'string' && reply) {
       updatePendingBotReply(chatId, reply, 1);
 
       try {
+        stage = 'send_reply';
+        log('info', 'reply_send_started', { correlationId });
         await msg.reply(reply);
       } catch (error) {
-        updatePendingBotReply(replyChatId, reply, -1);
+        updatePendingBotReply(chatId, reply, -1);
+        log('error', 'reply_send_failed', {
+          correlationId,
+          ...getErrorDetails(error),
+        });
         throw error;
       }
-      console.log('Resposta do webhook enviada ao grupo.');
+      log('info', 'reply_send_completed', { correlationId });
     } else {
-      console.warn('Webhook respondeu sem o campo "mensagem" ou "message".');
+      log('warn', 'webhook_reply_missing', { correlationId });
     }
+
+    log('info', 'message_processing_completed', { correlationId });
   } catch (error) {
-    console.error("Erro detalhado:", error); // Exibe o erro completo com stack trace
-    if (error.response) {
-        console.error("Dados da resposta:", error.response.data);
-    }
+    log('error', 'message_processing_failed', {
+      correlationId,
+      stage,
+      ...getErrorDetails(error),
+    });
   }
 }
 
 client.on('message_create', (msg) => {
+  const correlationId = randomUUID();
   if (msg.fromMe && msg.type === 'image') {
     const messageId = msg.id._serialized;
     if (outgoingImagesBeingChecked.has(messageId)) {
+      log('info', 'outgoing_image_check_already_running', { correlationId });
       return;
     }
 
     outgoingImagesBeingChecked.add(messageId);
-    console.log('Imagem enviada pela conta detectada; verificando o estado do upload.');
-    waitForOutgoingImage(msg)
+    log('info', 'outgoing_image_detected', { correlationId });
+    waitForOutgoingImage(msg, correlationId)
       .catch((error) => {
-        console.error('Erro ao aguardar a imagem enviada:', error.message);
+        log('error', 'outgoing_image_processing_failed', {
+          correlationId,
+          ...getErrorDetails(error),
+        });
       })
       .finally(() => outgoingImagesBeingChecked.delete(messageId));
     return;
   }
 
-  processMessage(msg);
+  processMessage(msg, correlationId);
 });
 
-client.initialize().catch((error) => {
-  console.error('Erro ao iniciar o cliente do WhatsApp:', error.message);
-});
+log('info', 'whatsapp_client_initialization_started');
+client.initialize()
+  .then(() => log('info', 'whatsapp_client_initialization_completed'))
+  .catch((error) => {
+    log('error', 'whatsapp_client_initialization_failed', getErrorDetails(error));
+  });

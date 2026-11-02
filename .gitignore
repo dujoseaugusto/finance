@@ -2,3 +2,5 @@
 .wwebjs_auth/
 .wwebjs_cache/
 node_modules/
+ops/logrotate/whatsapp-bot
+ops/systemd/
