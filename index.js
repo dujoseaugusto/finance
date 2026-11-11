@@ -8,7 +8,10 @@ const { Client, LocalAuth } = require('whatsapp-web.js');
 const groupName = process.env.NOME_DO_GRUPO;
 const webhookUrl = process.env.WEBHOOK_URL;
 const pendingBotReplies = new Map();
+const pendingAccountListRequests = new Map();
 const outgoingImagesBeingChecked = new Set();
+const accountListRequestTimeoutMs = 5 * 60 * 1000;
+const accountListPrompt = 'Deseja consultar as contas fixas do mês? Responda SIM para consultar.';
 
 function log(level, event, details = {}) {
   const write = level === 'error'
@@ -51,6 +54,87 @@ function updatePendingBotReply(chatId, text, amount) {
   const timer = setTimeout(() => pendingBotReplies.delete(key), 60000);
   timer.unref();
   pendingBotReplies.set(key, { count, timer });
+}
+
+function getAccountListRequestKey(chatId, msg) {
+  const senderId = getSerializedId(msg.author) || getSerializedId(msg.id?.participant);
+  return `${chatId}:${senderId || 'unknown-sender'}`;
+}
+
+function setPendingAccountListRequest(key) {
+  const pending = pendingAccountListRequests.get(key);
+  if (pending?.timer) {
+    clearTimeout(pending.timer);
+  }
+
+  const timer = setTimeout(() => pendingAccountListRequests.delete(key), accountListRequestTimeoutMs);
+  timer.unref();
+  pendingAccountListRequests.set(key, { timer });
+}
+
+function clearPendingAccountListRequest(key) {
+  const pending = pendingAccountListRequests.get(key);
+  if (pending?.timer) {
+    clearTimeout(pending.timer);
+  }
+  pendingAccountListRequests.delete(key);
+}
+
+async function sendBotReply(msg, chatId, text, correlationId, eventPrefix = 'reply') {
+  updatePendingBotReply(chatId, text, 1);
+  try {
+    log('info', `${eventPrefix}_send_started`, { correlationId });
+    await msg.reply(text);
+  } catch (error) {
+    updatePendingBotReply(chatId, text, -1);
+    log('error', `${eventPrefix}_send_failed`, {
+      correlationId,
+      ...getErrorDetails(error),
+    });
+    throw error;
+  }
+  log('info', `${eventPrefix}_send_completed`, { correlationId });
+}
+
+async function listOpenItems(correlationId) {
+  const requestStartedAt = Date.now();
+  log('info', 'account_list_request_started', { correlationId });
+  let response;
+  try {
+    response = await axios.post(webhookUrl, { acao: 'listarItensAPagar' });
+  } catch (error) {
+    log('error', 'account_list_request_failed', {
+      correlationId,
+      durationMs: Date.now() - requestStartedAt,
+      ...getErrorDetails(error),
+    });
+    throw error;
+  }
+
+  const items = response.data?.itens;
+  if (!Array.isArray(items) || items.some((item) => (
+    typeof item?.nome !== 'string'
+    || !item.nome.trim()
+    || typeof item?.statusIcone !== 'string'
+    || !item.statusIcone
+  ))) {
+    const error = new Error('Resposta inválida ao listar contas: esperado um array "itens" com "nome" e "statusIcone".');
+    log('error', 'account_list_response_invalid', {
+      correlationId,
+      durationMs: Date.now() - requestStartedAt,
+    });
+    throw error;
+  }
+
+  log('info', 'account_list_request_completed', {
+    correlationId,
+    httpStatus: response.status,
+    itemCount: items.length,
+    durationMs: Date.now() - requestStartedAt,
+  });
+  return items.length
+    ? items.map((item) => `${item.statusIcone} ${item.nome.trim()}`).join('\n')
+    : 'Nenhuma conta encontrada para este mês.';
 }
 
 function getSerializedId(value) {
@@ -210,6 +294,7 @@ async function processMessage(msg, correlationId = randomUUID()) {
       return;
     }
 
+    const accountListRequestKey = getAccountListRequestKey(chatId, msg);
     stage = 'resolve_group';
     log('info', 'group_lookup_started', { correlationId });
     const currentGroupName = await getCachedGroupName(chatId);
@@ -244,11 +329,35 @@ async function processMessage(msg, correlationId = randomUUID()) {
       return;
     }
 
+    if (pendingAccountListRequests.has(accountListRequestKey) && temTextoValido) {
+      clearPendingAccountListRequest(accountListRequestKey);
+      if (textoMensagem.toLocaleLowerCase('pt-BR') === 'sim') {
+        stage = 'list_open_items';
+        const accountList = await listOpenItems(correlationId);
+        stage = 'send_account_list';
+        await sendBotReply(msg, chatId, accountList, correlationId, 'account_list');
+        return;
+      }
+    }
+
+    if (!temNumeroNoTexto && !temImagem) {
+      setPendingAccountListRequest(accountListRequestKey);
+      stage = 'send_account_list_prompt';
+      try {
+        await sendBotReply(msg, chatId, accountListPrompt, correlationId, 'account_list_prompt');
+      } catch (error) {
+        clearPendingAccountListRequest(accountListRequestKey);
+        throw error;
+      }
+      return;
+    }
+
     if (!temNumeroNoTexto && !temImagem) {
       log('info', 'message_ignored_without_number_or_image', { correlationId });
       return;
     }
 
+    clearPendingAccountListRequest(accountListRequestKey);
     log('info', 'message_accepted', { correlationId, hasImage: temImagem });
     stage = 'resolve_sender';
     const contact = msg.fromMe ? null : await msg.getContact();
@@ -315,21 +424,8 @@ async function processMessage(msg, correlationId = randomUUID()) {
     });
     const reply = response.data?.mensagem || response.data?.message;
     if (typeof reply === 'string' && reply) {
-      updatePendingBotReply(chatId, reply, 1);
-
-      try {
-        stage = 'send_reply';
-        log('info', 'reply_send_started', { correlationId });
-        await msg.reply(reply);
-      } catch (error) {
-        updatePendingBotReply(chatId, reply, -1);
-        log('error', 'reply_send_failed', {
-          correlationId,
-          ...getErrorDetails(error),
-        });
-        throw error;
-      }
-      log('info', 'reply_send_completed', { correlationId });
+      stage = 'send_reply';
+      await sendBotReply(msg, chatId, reply, correlationId);
     } else {
       log('warn', 'webhook_reply_missing', { correlationId });
     }
