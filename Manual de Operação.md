@@ -1,83 +1,77 @@
 # Manual de Operação — WhatsApp Finance Bot
 
-**Projeto:** `/home/jose-augusto/projets/finance`  
-**Serviço Linux:** `whatsapp-bot`  
-**Agendamento:** Reinicialização diária às 04:00  
-**Usuário:** `jose-augusto`
+**Projeto:** `/home/jose-augusto/projets/finance`
 
----
+**Serviço systemd:** `whatsapp-bot`
 
-## 1. Verificar se o bot está funcionando
+**Usuário Linux:** `jose-augusto`
 
-**Consultar status completo:**
+Este manual reúne os comandos para verificar e controlar o bot nesta máquina. Use **systemd** como forma normal de execução; rode `npm start` manualmente apenas para testes ou diagnóstico, nunca ao mesmo tempo que o serviço.
+
+## Verificar e controlar o serviço
 
 ```bash
 sudo systemctl status whatsapp-bot
+sudo systemctl start whatsapp-bot
+sudo systemctl stop whatsapp-bot
+sudo systemctl restart whatsapp-bot
 ```
 
-Resultado esperado: `active (running)`.
-
-**Verificar rapidamente se está ativo:**
+Para verificar se o serviço está ativo e configurado para iniciar com o Linux:
 
 ```bash
 systemctl is-active whatsapp-bot
-```
-
-**Verificar se inicia automaticamente com o Linux:**
-
-```bash
 systemctl is-enabled whatsapp-bot
 ```
 
-Resultado esperado: `enabled`.
+Para habilitar o início automático ou desabilitá-lo:
 
----
+```bash
+sudo systemctl enable whatsapp-bot
+sudo systemctl disable whatsapp-bot
+```
 
-## 2. Acompanhar os logs
+## Consultar logs
 
-Por padrão, a saída da aplicação vai para o journal do systemd. Para manter uma retenção de três dias somente para o bot, aplique a configuração dedicada abaixo; depois disso, os logs da aplicação ficam no arquivo indicado e o journal continua registrando os eventos de início e parada do serviço.
-
-**Acompanhar mensagens do bot em tempo real:**
+Com a configuração de log em arquivo instalada, a saída normal do bot fica em `/home/jose-augusto/.local/state/whatsapp-bot/bot.log`. Acompanhar em tempo real:
 
 ```bash
 sudo tail -f /home/jose-augusto/.local/state/whatsapp-bot/bot.log
 ```
 
-**Consultar os últimos registros do bot:**
+Ver os últimos 100 registros:
 
 ```bash
 sudo tail -n 100 /home/jose-augusto/.local/state/whatsapp-bot/bot.log
 ```
 
-Cada registro do bot aparece em JSON, com horário, nível e evento. Os eventos `whatsapp_ready` e `whatsapp_disconnected` indicam, respectivamente, conexão pronta e desconexão. Use este arquivo também para acompanhar o QR Code.
-
-**Filtrar erros e avisos:**
+Filtrar avisos e erros:
 
 ```bash
 sudo tail -f /home/jose-augusto/.local/state/whatsapp-bot/bot.log | grep -E '"level":"(warn|error)"'
 ```
 
-**Consultar eventos de uma mensagem pelo identificador de correlação:**
-
-Cada etapa de processamento inclui um `correlationId`. Copie o valor do evento `message_received` e procure os registros relacionados:
+Os registros são JSON. Para acompanhar o processamento de uma mensagem, copie o `correlationId` do evento `message_received` e procure todas as etapas relacionadas:
 
 ```bash
 sudo grep -F 'ID_DE_CORRELACAO' /home/jose-augusto/.local/state/whatsapp-bot/bot.log*
 ```
 
-Os registros identificam etapas como `image_download_started`, `webhook_request_started` e `reply_send_completed`. Falhas incluem o campo `stage`, que aponta a etapa em que ocorreram.
+Eventos como `image_download_started`, `webhook_request_started` e `reply_send_completed` indicam o progresso; em falhas, o campo `stage` mostra a etapa. `group_name_mismatch` indica que o nome do grupo recebido difere do configurado.
 
-Quando o título do grupo não corresponder à configuração, o evento `group_name_mismatch` registra os dois títulos para facilitar a comparação. Os logs da aplicação são mantidos em arquivo e rotacionados diariamente, com retenção aproximada de três dias.
-
-O journal continua disponível para eventos do próprio systemd, como início e parada do serviço:
+O journal do systemd registra eventos do serviço e a saída de erro do processo:
 
 ```bash
 sudo journalctl -u whatsapp-bot -f
+sudo journalctl -u whatsapp-bot -n 100
+sudo journalctl -u whatsapp-bot --since "24 hours ago"
 ```
 
-### Configurar logs do bot e retenção de três dias
+Para sair de uma visualização em tempo real, pressione `Ctrl+C`.
 
-Instale o drop-in do systemd e a regra do logrotate incluídos no projeto:
+### Configurar arquivo de log e rotação
+
+Se os arquivos de configuração `ops/systemd/whatsapp-bot-logging.conf` e `ops/logrotate/whatsapp-bot` estiverem disponíveis no projeto, instale-os uma vez:
 
 ```bash
 cd /home/jose-augusto/projets/finance
@@ -88,136 +82,57 @@ sudo systemctl daemon-reload
 sudo systemctl restart whatsapp-bot
 ```
 
-O drop-in envia a saída da aplicação para `/home/jose-augusto/.local/state/whatsapp-bot/bot.log`. A pasta precisa existir antes de reiniciar o serviço. O logrotate divide o arquivo diariamente e limita a retenção a dois arquivos anteriores e três dias de idade. Para conferir a regra sem rotacionar arquivos:
+A rotação é diária, mantém até dois arquivos rotacionados e remove arquivos com mais de três dias na próxima execução do logrotate. Validar a regra sem rotacionar arquivos:
 
 ```bash
 sudo logrotate --debug /etc/logrotate.d/whatsapp-bot
 ```
 
-**Consultar os últimos 100 eventos do systemd:**
+## Reinicialização diária
+
+Se o timer `whatsapp-bot-restart.timer` estiver instalado, consultar a próxima execução, o estado e o histórico:
 
 ```bash
-sudo journalctl -u whatsapp-bot -n 100
+systemctl list-timers whatsapp-bot-restart.timer
+sudo systemctl status whatsapp-bot-restart.timer
+systemctl is-enabled whatsapp-bot-restart.timer
+sudo journalctl -u whatsapp-bot-restart.service -n 50
 ```
 
-**Consultar eventos do systemd das últimas 24 horas:**
+O timer está previsto para reiniciar o bot diariamente às 04:00. Se estiver configurado com `Persistent=true`, uma execução perdida enquanto a máquina estava desligada poderá ocorrer quando ela voltar a ligar.
+
+## Executar manualmente
+
+Use este modo apenas com o serviço parado:
 
 ```bash
-sudo journalctl -u whatsapp-bot --since "24 hours ago"
+sudo systemctl stop whatsapp-bot
+cd /home/jose-augusto/projets/finance
+npm start
 ```
 
-**Sair da visualização dos logs:** pressione `Ctrl + C`.
-
----
-
-## 3. Controlar o bot manualmente
-
-**Iniciar:**
+Para encerrar a execução manual, pressione `Ctrl+C`. Depois, retome a execução normal:
 
 ```bash
 sudo systemctl start whatsapp-bot
 ```
 
-**Parar:**
+## Reconectar o WhatsApp
 
-```bash
-sudo systemctl stop whatsapp-bot
-```
+Se for solicitado um novo pareamento:
 
-**Reiniciar:**
+1. Acompanhe a saída do bot. Com o serviço systemd e o log em arquivo, use:
+   ```bash
+   sudo tail -f /home/jose-augusto/.local/state/whatsapp-bot/bot.log
+   ```
+   Se estiver executando com `npm start`, o QR Code aparece no próprio terminal.
+2. No celular, abra **WhatsApp > Dispositivos conectados > Conectar dispositivo**.
+3. Escaneie o QR Code.
+4. Aguarde o evento `whatsapp_ready`, que confirma que o cliente está pronto.
 
-```bash
-sudo systemctl restart whatsapp-bot
-```
+## Observações
 
-**Depois de reiniciar, acompanhar os logs:**
-
-```bash
-sudo tail -f /var/log/whatsapp-bot/bot.log
-```
-
----
-
-## 4. Verificar a reinicialização diária (04:00)
-
-**Consultar o próximo horário programado:**
-
-```bash
-systemctl list-timers whatsapp-bot-restart.timer
-```
-
-**Consultar o status do agendamento:**
-
-```bash
-sudo systemctl status whatsapp-bot-restart.timer
-```
-
-Resultado esperado: `active (waiting)`.
-
-**Verificar se o agendamento está habilitado:**
-
-```bash
-systemctl is-enabled whatsapp-bot-restart.timer
-```
-
-Resultado esperado: `enabled`.
-
-**Consultar o histórico das reinicializações:**
-
-```bash
-sudo journalctl -u whatsapp-bot-restart.service -n 50
-```
-
----
-
-## 5. Quando perder a sessão do WhatsApp
-
-Se o WhatsApp desconectar e solicitar uma nova autenticação:
-
-1. Abra o terminal.
-2. Execute:
-
-```bash
-sudo journalctl -u whatsapp-bot -f -o cat
-```
-
-3. Aguarde a geração do QR Code.
-4. Abra o WhatsApp no celular.
-5. Entre em **Dispositivos conectados**.
-6. Selecione **Conectar dispositivo**.
-7. Escaneie o QR Code exibido no terminal.
-
-Depois da autenticação, procure o evento `whatsapp_ready`, que indica que o cliente está pronto:
-
-```json
-{"level":"info","event":"whatsapp_ready"}
-```
-
----
-
-## 6. Resumo dos comandos mais utilizados
-
-| Necessidade | Comando |
-|---|---|
-| Verificar funcionamento | `sudo systemctl status whatsapp-bot` |
-| Acompanhar logs do bot | `sudo tail -f /home/jose-augusto/.local/state/whatsapp-bot/bot.log` |
-| Ver últimos registros do bot | `sudo tail -n 100 /home/jose-augusto/.local/state/whatsapp-bot/bot.log` |
-| Ver eventos do systemd | `sudo journalctl -u whatsapp-bot -f` |
-| Reiniciar bot | `sudo systemctl restart whatsapp-bot` |
-| Iniciar bot | `sudo systemctl start whatsapp-bot` |
-| Parar bot | `sudo systemctl stop whatsapp-bot` |
-| Ver próximo agendamento | `systemctl list-timers whatsapp-bot-restart.timer` |
-| Ver status do agendamento | `sudo systemctl status whatsapp-bot-restart.timer` |
-
----
-
-## 7. Observações importantes
-
-- Não execute `npm start` manualmente enquanto o serviço systemd estiver ativo, para evitar duas instâncias do bot.
-- A sessão do WhatsApp é mantida pelo mecanismo de autenticação do projeto.
-- O reinício diário às 04:00 não deve apagar a sessão salva.
-- Se o computador estiver desligado às 04:00, o timer configurado com `Persistent=true` poderá executar a tarefa quando o Linux voltar a funcionar.
-- O systemd reinicia o processo quando ele encerra, mas não garante a recuperação de uma sessão inválida do WhatsApp.
-- Os logs do bot não registram o texto das mensagens, imagens, números de telefone nem o conteúdo retornado pelo webhook.
-
-**Objetivo:** manter o WhatsApp Finance Bot funcionando continuamente, com inicialização automática, reinicialização diária e facilidade para diagnosticar problemas.
+- Não execute `npm start` enquanto o serviço systemd estiver ativo; isso inicia uma segunda instância.
+- A sessão do WhatsApp fica salva localmente pelo `LocalAuth` e não deve ser apagada durante uma reinicialização normal.
+- O systemd reinicia o processo se ele encerrar, mas não garante a recuperação de uma sessão inválida.
+- O bot não registra o texto das mensagens, imagens, números de telefone nem o conteúdo retornado pelo webhook.
